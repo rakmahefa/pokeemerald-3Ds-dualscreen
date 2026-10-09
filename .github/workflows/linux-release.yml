@@ -122,14 +122,32 @@ jobs:
 
           "$RUNNER_TEMP/linux-venv/bin/pyinstaller" \
             --noconfirm --clean --onefile \
+            --collect-all PIL \
+            --hidden-import PIL.Image \
+            --hidden-import PIL.ImageDraw \
             --name Emerald3DS-Builder \
             --paths "$GITHUB_WORKSPACE/builder" \
             --distpath "$RUNNER_TEMP/pyinstaller-dist" \
             --workpath "$RUNNER_TEMP/pyinstaller-work" \
             --specpath "$RUNNER_TEMP/pyinstaller-work" \
             "$RUNNER_TEMP/linux_entry.py"
-          "$RUNNER_TEMP/pyinstaller-dist/Emerald3DS-Builder" --version
-          "$RUNNER_TEMP/pyinstaller-dist/Emerald3DS-Builder" --help >/dev/null
+
+          executable="$RUNNER_TEMP/pyinstaller-dist/Emerald3DS-Builder"
+          "$executable" --version
+          "$executable" --help >/dev/null
+
+          # Generator scripts are loaded dynamically from payload/voxelgen, so
+          # PyInstaller cannot infer their Pillow imports from normal imports.
+          # Smoke-test Pillow through the same frozen --run-script path used by
+          # the terrain/building generators before publishing the archive.
+          cat > "$RUNNER_TEMP/pillow-smoke.py" <<'PY'
+          from PIL import Image, ImageDraw
+          image = Image.new("RGB", (2, 2), "white")
+          ImageDraw.Draw(image).point((0, 0), fill="black")
+          assert image.getpixel((0, 0)) == (0, 0, 0)
+          print("Pillow frozen-import smoke test passed")
+          PY
+          "$executable" --run-script "$RUNNER_TEMP/pillow-smoke.py"
 
       - name: Assemble Linux release archive
         shell: bash
