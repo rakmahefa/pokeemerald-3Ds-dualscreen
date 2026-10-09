@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Tag of an existing draft release (for example v0.3.0)
+        description: "Release tag (for example v0.3.0); matching upstream WebPayload must exist"
         required: true
         type: string
 
@@ -17,8 +17,11 @@ concurrency:
 
 jobs:
   linux-builder:
-    name: Build Linux x86_64 builder and attach it to the draft Release
+    name: Build Linux x86_64 builder and publish it
     runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+
     steps:
       - name: Validate release tag
         id: release
@@ -57,47 +60,49 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends python3 python3-dev python3-venv python3-tk tk8.6 unzip jq curl
 
-      - name: Find draft Release and download its matching Windows payload
+      - name: Download and validate the matching upstream WebPayload
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.release.outputs.tag }}
           VERSION: ${{ steps.release.outputs.version }}
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/release-input"
-          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
-          release_id="$(jq -r --arg tag "$TAG" '[.[] | select(.tag_name == $tag and .draft == true)] | first | .id // empty' "$RUNNER_TEMP/releases.json")"
-          if [[ -z "$release_id" ]]; then
-            echo "::error::No draft Release found for $TAG. Create a draft Release first and upload Emerald3DS-v${VERSION}-Windows.zip before running this workflow."
+          release_json="$RUNNER_TEMP/upstream-release.json"
+          gh api "repos/ZallaxDev/pokeemerald-3Ds-dualscreen/releases/tags/$TAG" > "$release_json"
+          if ! jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == false' "$release_json" >/dev/null; then
+            echo "::error::The matching upstream release $TAG does not exist or is still a draft."
             exit 1
           fi
-          echo "RELEASE_ID=$release_id" >> "$GITHUB_ENV"
-          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" > "$RUNNER_TEMP/release-assets.json"
-          windows_asset="Emerald3DS-v${VERSION}-Windows.zip"
-          windows_id="$(jq -r --arg name "$windows_asset" '[.[] | select(.name == $name)] | first | .id // empty' "$RUNNER_TEMP/release-assets.json")"
-          if [[ -z "$windows_id" ]]; then
-            echo "::error::Draft Release $TAG is missing $windows_asset. Upload the standard Windows bundle first."
-            exit 1
-          fi
-          curl --fail --silent --show-error --location \
-            -H 'Accept: application/octet-stream' \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/assets/$windows_id" \
-            --output "$RUNNER_TEMP/release-input/$windows_asset"
 
-          # Keep existing checksums for the other release files, if present.
-          sums_id="$(jq -r '[.[] | select(.name == "SHA256SUMS.txt")] | first | .id // empty' "$RUNNER_TEMP/release-assets.json")"
-          if [[ -n "$sums_id" ]]; then
-            curl --fail --silent --show-error --location \
-              -H 'Accept: application/octet-stream' \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H 'X-GitHub-Api-Version: 2022-11-28' \
-              "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/assets/$sums_id" \
-              --output "$RUNNER_TEMP/release-input/SHA256SUMS.txt"
-          else
-            : > "$RUNNER_TEMP/release-input/SHA256SUMS.txt"
+          asset_url="$(jq -er '[.assets[] | select(.name == "Emerald3DS-WebPayload.zip")][0].browser_download_url' "$release_json")"
+          expected_sha256="$(jq -er '[.assets[] | select(.name == "Emerald3DS-WebPayload.zip")][0].digest | select(type == "string" and startswith("sha256:")) | ltrimstr("sha256:")' "$release_json")"
+          archive="$RUNNER_TEMP/Emerald3DS-WebPayload.zip"
+          curl --fail --silent --show-error --location --retry 3 "$asset_url" --output "$archive"
+          printf '%s  %s\n' "$expected_sha256" "$archive" | sha256sum --check -
+
+          mkdir -p "$RUNNER_TEMP/webpayload"
+          unzip -q "$archive" -d "$RUNNER_TEMP/webpayload"
+          unpack="$RUNNER_TEMP/webpayload"
+          payload="$unpack/payload"
+          if ! jq -e --arg version "$VERSION" --arg tag "$TAG" \
+            '.releaseVersion == $version and .releaseTag == $tag and (.synthetic != true)' \
+            "$unpack/web-manifest.json" >/dev/null; then
+            echo "::error::The downloaded WebPayload manifest does not match $TAG."
+            exit 1
+          fi
+          for required in Emerald3DS.3dsx Emerald3DS.smdh emerald3ds.recipe; do
+            if [[ ! -f "$payload/$required" ]]; then
+              echo "::error::WebPayload is missing payload/$required."
+              exit 1
+            fi
+          done
+          if [[ ! -d "$payload/voxelgen" ]] || ! find "$payload/voxelgen" -type f -name '*.py' -print -quit | grep -q .; then
+            echo "::error::WebPayload is missing the voxelgen Python scripts."
+            exit 1
+          fi
+          if [[ ! -d "$unpack/licenses" ]]; then
+            echo "::error::WebPayload is missing its licenses/ directory."
+            exit 1
           fi
 
       - name: Build portable Linux executable
@@ -132,44 +137,19 @@ jobs:
           VERSION: ${{ steps.release.outputs.version }}
         run: |
           set -euo pipefail
-          input_zip="$RUNNER_TEMP/release-input/Emerald3DS-v${VERSION}-Windows.zip"
-          unpack="$RUNNER_TEMP/windows-unpacked"
+          unpack="$RUNNER_TEMP/webpayload"
           staging="$RUNNER_TEMP/linux-package/Emerald3DS-v${VERSION}-Linux-x86_64"
-          mkdir -p "$unpack" "$staging"
-          unzip -q "$input_zip" -d "$unpack"
+          mkdir -p "$staging"
 
-          # Reuse the recipe and generators already prepared for this exact release.
-          recipe="$(find "$unpack" -type f -name emerald3ds.recipe -not -path '*/es/*' -print -quit)"
-          if [[ -z "$recipe" ]]; then
-            echo "::error::No English payload/emerald3ds.recipe was found in the Windows release archive."
-            exit 1
-          fi
-          payload="${recipe%/emerald3ds.recipe}"
-          for required in Emerald3DS.3dsx Emerald3DS.smdh; do
-            if [[ ! -f "$payload/$required" ]]; then
-              echo "::error::Release payload is missing $required."
-              exit 1
-            fi
-          done
-          if [[ ! -d "$payload/voxelgen" ]]; then
-            echo "::error::Release payload is missing voxelgen/."
-            exit 1
-          fi
-
-          cp -a "$payload" "$staging/payload"
+          # Use the upstream web payload; no Windows ZIP or Windows executable is required.
+          cp -a "$unpack/payload" "$staging/payload"
+          cp -a "$unpack/licenses" "$staging/LICENSES"
           install -m 0755 "$RUNNER_TEMP/pyinstaller-dist/Emerald3DS-Builder" "$staging/Emerald3DS-Builder"
-          licenses="$(find "$unpack" -type d -name LICENSES -print -quit)"
-          if [[ -n "$licenses" ]]; then
-            cp -a "$licenses" "$staging/LICENSES"
-          else
-            mkdir -p "$staging/LICENSES"
-            cp LICENSE-PORT.md NOTICE.md AI_DISCLOSURE.md "$staging/LICENSES/"
-          fi
 
           cat > "$staging/README-Linux.txt" <<'EOF'
           Pokémon Emerald 3Ds Dual Screen — Linux builder (x86_64)
 
-          This package contains the Linux builder and the matching payload for this release.
+          This package contains the native Linux builder and the matching game payload.
           It does not contain a Pokémon ROM or a generated game data pack.
 
           GUI mode:
@@ -180,13 +160,12 @@ jobs:
             ./Emerald3DS-Builder build --rom /path/to/your-emerald.gba --output /path/to/output
             ./Emerald3DS-Builder install --rom /path/to/your-emerald.gba --sd /path/to/3ds-sd-card
 
-          Use a clean, supported dump of your own Pokémon Emerald cartridge. The ROM is read
-          locally and is not uploaded or included in the release. The generated data pack is
-          written to the output folder or your SD card. Run this executable from the extracted
-          folder so it can find the adjacent payload/ directory.
+          Run this executable from the extracted folder so it can find the adjacent payload/
+          directory. Use your own clean, supported Pokémon Emerald cartridge dump. The ROM is
+          read locally and is not uploaded or included in this archive.
 
-          This is a Linux x86_64 builder; the game it installs is Nintendo 3DS homebrew, not a
-          native Linux game executable. A desktop session is required for GUI mode.
+          This is a Linux x86_64 desktop application. GUI mode needs a graphical desktop
+          session. The game it installs is Nintendo 3DS homebrew, not a native Linux game.
           EOF
 
           asset="$RUNNER_TEMP/Emerald3DS-v${VERSION}-Linux-x86_64.tar.gz"
@@ -195,20 +174,55 @@ jobs:
           echo "ASSET=$asset" >> "$GITHUB_ENV"
           echo "ASSET_NAME=$(basename "$asset")" >> "$GITHUB_ENV"
 
-      - name: Update draft Release assets and checksums
+      - name: Create or reuse the target GitHub Release
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
+          release_json="$RUNNER_TEMP/target-release.json"
+          releases_json="$RUNNER_TEMP/target-releases.json"
+
+          # List releases so drafts are found too; the by-tag endpoint may only
+          # return published releases. Create a draft automatically if absent.
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$releases_json"
+          release_id="$(jq -r --arg tag "$TAG" '[.[] | select(.tag_name == $tag)] | first | .id // empty' "$releases_json")"
+          if [[ -z "$release_id" ]]; then
+            gh release create "$TAG" --draft --verify-tag \
+              --title "Emerald3DS $TAG — Linux x86_64" \
+              --notes "Linux x86_64 builder for Emerald3DS $TAG. Extract the archive and run ./Emerald3DS-Builder from the extracted directory. This package contains no ROM; use your own supported Pokémon Emerald dump."
+            gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$releases_json"
+            release_id="$(jq -er --arg tag "$TAG" '[.[] | select(.tag_name == $tag)] | first | .id' "$releases_json")"
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > "$release_json"
+          echo "RELEASE_ID=$release_id" >> "$GITHUB_ENV"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" > "$RUNNER_TEMP/release-assets.json"
+
+      - name: Upload Linux archive and refresh checksums
+        shell: bash
+        run: |
+          set -euo pipefail
           assets_json="$RUNNER_TEMP/release-assets.json"
-          sums="$RUNNER_TEMP/release-input/SHA256SUMS.txt"
+          sums="$RUNNER_TEMP/existing-SHA256SUMS.txt"
           checksum_tmp="$RUNNER_TEMP/SHA256SUMS.txt"
+
+          # Preserve checksums for other existing release assets, if present.
+          sums_id="$(jq -r '[.[] | select(.name == "SHA256SUMS.txt")][0].id // empty' "$assets_json")"
+          if [[ -n "$sums_id" ]]; then
+            curl --fail --silent --show-error --location \
+              -H 'Accept: application/octet-stream' \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/assets/$sums_id" \
+              --output "$sums"
+          else
+            : > "$sums"
+          fi
+
           awk -v asset="$ASSET_NAME" '$2 != asset { print }' "$sums" > "$checksum_tmp"
           sha256sum "$ASSET" | awk -v asset="$ASSET_NAME" '{ print $1 "  " asset }' >> "$checksum_tmp"
 
-          # Re-runs replace their previous Linux archive and checksum list cleanly.
+          # Replace prior copies on re-runs.
           for name in "$ASSET_NAME" "SHA256SUMS.txt"; do
             ids="$(jq -r --arg name "$name" '.[] | select(.name == $name) | .id' "$assets_json")"
             while IFS= read -r id; do
@@ -227,4 +241,5 @@ jobs:
               --data-binary "@$file" \
               "$upload_url?name=$name" >/dev/null
           done
-          echo "Uploaded $ASSET_NAME and refreshed SHA256SUMS.txt to draft Release $TAG. Publish the Release after checking its assets."
+          echo "Uploaded $ASSET_NAME and refreshed SHA256SUMS.txt on release $TAG."
+          echo "The payload came from ZallaxDev/pokeemerald-3Ds-dualscreen; no Windows ZIP is required."
