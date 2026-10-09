@@ -200,6 +200,8 @@ jobs:
 
       - name: Upload Linux archive and refresh checksums
         shell: bash
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
           assets_json="$RUNNER_TEMP/release-assets.json"
